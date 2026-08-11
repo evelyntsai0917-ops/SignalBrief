@@ -4,9 +4,9 @@ import { onMounted, ref } from 'vue'
 const message = ref('Loading...')
 
 onMounted(async () => {
-  const response = await fetch('http://localhost:8000/')
+  const response = await fetch('http://localhost:8000/api/health')
   const data = await response.json()
-  message.value = data.message
+  message.value = data.status
 })
 </script>
 
