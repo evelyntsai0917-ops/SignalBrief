@@ -15,3 +15,18 @@ app.add_middleware(
 @app.get("/api/health")
 def health_check():
     return {"status": "ok"}
+
+@app.get("/api/signals")
+def get_signals():
+    return [
+        {
+            "id": 1,
+            "title": "AI demand remains strong",
+            "summary": "Semiconductor and server demand continue to support the AI supply chain."
+        },
+        {
+            "id": 2,
+            "title": "Markets watch interest rates",
+            "summary": "Investors are monitoring central bank policy and inflation data."
+        }
+    ]
