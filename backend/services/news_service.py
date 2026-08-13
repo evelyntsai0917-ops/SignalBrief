@@ -3,11 +3,9 @@
 # ---------------------------------------------------------
 # 這個 module 負責所有「新聞取得與前處理」邏輯。
 
-# GDELT
+# GDELT（1 次）
 #   ↓
-# 四大投資主題 query
-#   ↓
-# 最近 24 小時
+# 最近 24 小時 + trusted domains
 #   ↓
 # trusted source hard filter
 #   ↓
@@ -16,10 +14,65 @@
 # candidate articles
 # ---------------------------------------------------------
 
-from datetime import datetime, timedelta
+from datetime import datetime
+from pathlib import Path
 from urllib.parse import urlparse
+import json
+import threading
 import time
 import requests
+from services.ranking_service import rank_articles
+
+
+def log(message: str):
+    print(message, flush=True)
+
+
+CACHE_PATH = Path(__file__).resolve().parent.parent / "data" / "candidates_cache.json"
+
+
+def _load_disk_cache() -> list | None:
+    if not CACHE_PATH.exists():
+        return None
+
+    try:
+        payload = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        articles = payload.get("articles") if isinstance(payload, dict) else payload
+        if isinstance(articles, list) and articles:
+            return articles
+    except (OSError, json.JSONDecodeError) as exc:
+        log(f"disk cache unreadable: {exc}")
+
+    return None
+
+
+def _save_disk_cache(articles: list) -> None:
+    CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CACHE_PATH.write_text(
+        json.dumps(
+            {"saved_at": datetime.utcnow().isoformat(), "articles": articles},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _previous_articles() -> list:
+    memory = _candidate_cache["articles"]
+    if memory:
+        return memory
+
+    disk = _load_disk_cache()
+    if disk:
+        _candidate_cache["articles"] = disk
+        return disk
+
+    return []
+
+
+GDELT_HEADERS = {
+    "User-Agent": "SignalBrief/1.0 (educational news brief)",
+}
 
 # ---------------------------------------------------------
 # GDELT DOC 2.0 API endpoint
@@ -50,94 +103,46 @@ GDELT_DOC_API = "https://api.gdeltproject.org/api/v2/doc/doc"
 # - 重要公司基本面
 # ---------------------------------------------------------
 
-SEARCH_QUERIES = {
-    # -----------------------------------------------------
-    # 1. 地緣政治與全球風險
-    # 例如：
-    # - 戰爭
-    # - 制裁
-    # - 關稅
-    # - 台海
-    # - 中美關係
-    # - 中東
-    # - 出口管制
-    # 這些事件可能進一步影響：
-    # 股票市場、能源、半導體與全球供應鏈。
-    # -----------------------------------------------------
-    "geopolitics":
-        '(war OR conflict OR sanctions OR tariff OR "trade war" OR "export controls" '
-        'OR blockade OR military OR tension) '
-        'AND (market OR economy OR "supply chain" OR energy OR semiconductor '
-        'OR China OR Taiwan OR Russia OR Ukraine OR "Middle East" OR Iran)',
+# GDELT DOC API 會拒絕過長 query，回傳純文字：
+#   "Your query was too short or too long."
+# 實測約 250 字元以上就會失敗。
+# GDELT：OR 只能出現在 () 裡；空白視為 AND。
+#
+# 開發 endpoint 只打 1 次 GDELT。
+# 四類主題用來在本地標 category，不再各打一次 API。
+GDELT_CANDIDATE_QUERY = (
+    "(Taiwan OR sanctions OR inflation OR Nvidia OR TSMC OR "
+    "earnings OR semiconductor)"
+)
 
-    # -----------------------------------------------------
-    # 2. 總體經濟與政策
-    #
-    # 例如：
-    # - CPI / PCE
-    # - 利率
-    # - Fed
-    # - GDP
-    # - 就業
-    # - recession
-    # - bond yields
-    # - liquidity
-    #
-    # 這些資訊會直接影響：
-    # 市場估值、資金成本、風險偏好。
-    # -----------------------------------------------------
-    "macro":
-        '(inflation OR CPI OR PCE OR "interest rates" OR "rate cut" OR "rate hike" '
-        'OR GDP OR employment OR unemployment OR payrolls OR recession '
-        'OR "economic growth" OR "bond yields" OR "Treasury yields" OR dollar OR liquidity) '
-        'AND ("Federal Reserve" OR "central bank" OR "monetary policy" '
-        'OR market OR stocks OR economy OR US OR China OR "global economy")',
-
-    # -----------------------------------------------------
-    # 3. AI 與半導體供應鏈
-    #
-    # 這是 SignalBrief 用來尋找
-    # 「下一個可能形成投資風口的產業變化」
-    # 最重要的類別之一。
-    # 包含：
-    # - AI infrastructure
-    # - AI server
-    # - GPU
-    # - data center
-    # - HBM
-    # - memory
-    # - advanced packaging
-    # - foundry
-    # - 重要半導體公司
-    # -----------------------------------------------------
-    "ai_semiconductor":
-        '("AI infrastructure" OR "AI server" OR "data center" OR GPU OR accelerator '
-        'OR semiconductor OR foundry OR "advanced packaging" OR HBM '
-        'OR "high bandwidth memory" OR "memory chip" '
-        'OR TSMC OR Nvidia OR AMD OR Broadcom OR ASML OR Micron OR Samsung OR "SK Hynix") '
-        'AND (demand OR supply OR shortage OR capacity OR investment OR orders '
-        'OR expansion OR guidance OR revenue OR launch OR production)',
-    # -----------------------------------------------------
-    # 4. 公司重大事件
-    # 我們不希望抓所有企業新聞。
-    # 這一類只關注可能改變：
-    # - 公司成長
-    # - 獲利
-    # - 市場預期
-    # - 供應能力
-    # - 重大風險
-    # 的事件。
-    # -----------------------------------------------------
-    "company_events":
-        '(earnings OR revenue OR profit OR guidance OR forecast OR acquisition '
-        'OR merger OR partnership OR contract OR order OR investment OR layoffs '
-        'OR restructuring OR bankruptcy OR investigation OR lawsuit OR recall '
-        'OR "new product" OR expansion OR "new factory" OR "production capacity" '
-        'OR "major customer") '
-        'AND (beat OR miss OR raise OR cut OR growth OR decline OR company '
-        'OR technology OR semiconductor OR AI OR shares OR market OR revenue '
-        'OR demand OR orders)',
+CATEGORY_KEYWORDS = {
+    "geopolitics": ["taiwan", "sanctions", "tariff", "trade war"],
+    "macro": ["inflation", "cpi", "federal reserve", "rate cut"],
+    "ai_semiconductor": ["nvidia", "tsmc", "gpu", "hbm", "semiconductor"],
+    "company_events": ["earnings", "guidance", "acquisition", "layoffs"],
 }
+
+# GDELT 是全球新聞火hose。如果不在 query 裡限制 domain，
+# datedesc 的前 N 筆幾乎都是各地小站，trusted source filter 會把結果濾成 0。
+# 這組 domain 必須夠短，才能和上面的 keyword query 加總後仍 < 250 字元。
+GDELT_DOMAIN_FILTER = (
+    "(domain:reuters.com OR domain:cnbc.com OR domain:apnews.com OR "
+    "domain:bloomberg.com OR domain:techcrunch.com OR domain:cnyes.com OR "
+    "domain:bnext.com.tw)"
+)
+
+# GDELT 官方說每 5 秒 1 個 request；實測 5 秒仍常 429，所以拉到 8 秒。
+MIN_GDELT_INTERVAL_SECONDS = 8
+_last_gdelt_request_at = 0.0
+
+# /api/news/candidates 是開發用 inspection API。
+# 短 cache 避免連續重整就再次打爆 GDELT rate limit，看起來又像 0 articles。
+CANDIDATE_CACHE_TTL_SECONDS = 10 * 60
+_candidate_cache = {
+    "fetched_at": 0.0,
+    "articles": None,
+}
+_fetch_lock = threading.Lock()
 # ---------------------------------------------------------
 # Trusted news source whitelist
 # ---------------------------------------------------------
@@ -183,63 +188,24 @@ TRUSTED_SOURCES = {
     "moneydj.com",
     "businesstoday.com.tw",
 }
-# ---------------------------------------------------------
-# Temporary mock SignalBrief data
-# ---------------------------------------------------------
-mock_signals = [
-    {
-        "id": 1,
-        "title": "AI 伺服器需求持續成長",
-        "summary_points": [
-            "大型雲端業者持續增加 AI 基礎設施投資",
-            "GPU 與先進封裝需求維持強勁",
-            "台灣半導體供應鏈可能持續受惠",
-        ],
-        "category": "investment",
-        "subcategory": "ai_semiconductor",
-        "impact_path": "AI 資本支出增加 → GPU 與伺服器需求增加 → 半導體供應鏈受惠",
-        "importance_score": 88.5,
-        "top_rank": 1,
-        "source_name": "Reuters",
-        "source_url": "https://example.com/article-1",
-        "published_at": "2026-08-10T08:30:00",
-    },
-    {
-        "id": 2,
-        "title": "市場持續關注利率政策",
-        "summary_points": [
-            "投資人關注央行下一步利率決策",
-            "通膨數據仍是政策判斷的重要依據",
-            "利率預期可能影響科技股與成長股估值",
-        ],
-        "category": "investment",
-        "subcategory": "macro",
-        "impact_path": "利率預期改變 → 資金成本與估值調整 → 股票市場波動",
-        "importance_score": 82.0,
-        "top_rank": 2,
-        "source_name": "Reuters",
-        "source_url": "https://example.com/article-2",
-        "published_at": "2026-08-12T07:45:00",
-    },
-]
 
-
-# ---------------------------------------------------------
-# Read current SignalBrief signals
-# ---------------------------------------------------------
-# 這裡很可能會改成直接讀 database，
-# 不會在 user request 時重新抓外部新聞。
-# ---------------------------------------------------------
-
-def get_latest_signals():
-    now = datetime.now()
-    cutoff_time = now - timedelta(hours=24)
-
-    return [
-        signal
-        for signal in mock_signals
-        if datetime.fromisoformat(signal["published_at"]) >= cutoff_time
-    ]
+SOURCE_DISPLAY = {
+    "reuters.com": "Reuters",
+    "apnews.com": "AP News",
+    "bloomberg.com": "Bloomberg",
+    "ft.com": "Financial Times",
+    "wsj.com": "WSJ",
+    "cnbc.com": "CNBC",
+    "techcrunch.com": "TechCrunch",
+    "theverge.com": "The Verge",
+    "arstechnica.com": "Ars Technica",
+    "wired.com": "Wired",
+    "bnext.com.tw": "數位時代",
+    "techorange.com": "科技報橘",
+    "cnyes.com": "鉅亨網",
+    "moneydj.com": "MoneyDJ",
+    "businesstoday.com.tw": "今周刊",
+}
 
 
 # ---------------------------------------------------------
@@ -263,6 +229,39 @@ def normalize_domain(domain: str) -> str:
         domain = domain[4:]
 
     return domain
+
+
+def is_trusted_source(domain: str) -> bool:
+    domain = normalize_domain(domain)
+
+    if domain in TRUSTED_SOURCES:
+        return True
+
+    # uk.reuters.com 仍視為 reuters.com
+    return any(domain.endswith("." + source) for source in TRUSTED_SOURCES)
+
+
+def _respect_gdelt_rate_limit():
+    global _last_gdelt_request_at
+
+    elapsed = time.time() - _last_gdelt_request_at
+
+    if _last_gdelt_request_at and elapsed < MIN_GDELT_INTERVAL_SECONDS:
+        time.sleep(MIN_GDELT_INTERVAL_SECONDS - elapsed)
+
+    _last_gdelt_request_at = time.time()
+
+
+def classify_article(article: dict) -> str:
+    text = f"{article.get('title') or ''} {article.get('url') or ''}".lower()
+
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        if any(keyword in text for keyword in keywords):
+            return category
+
+    return "uncategorized"
+
+
 # ---------------------------------------------------------
 # Fetch articles from GDELT
 # ---------------------------------------------------------
@@ -283,97 +282,85 @@ def normalize_domain(domain: str) -> str:
 # ---------------------------------------------------------
 
 def fetch_gdelt_articles(query: str, max_records: int = 50):
+    full_query = f"{query} {GDELT_DOMAIN_FILTER}"
+
+    log(
+        f"GDELT query_len={len(full_query)} "
+        f"keyword_len={len(query)}"
+    )
+
     params = {
-        "query": query,
+        "query": full_query,
         "mode": "artlist",
         "format": "json",
 
-        # GDELT 只搜尋最近 24 小時。
-        "timespan": "24h",
+        # 先抓最近 3 天，避免 24h + trusted domain 剛好沒稿。
+        "timespan": "3d",
 
         # 避免一次抓過多資料。
         "maxrecords": max_records,
 
-        # 最新新聞優先。
-        "sort": "datedesc",
+        # 最新新聞優先。官方參數是 DateDesc。
+        "sort": "DateDesc",
     }
 
-    # -----------------------------------------------------
-    # Retry strategy
-    # -----------------------------------------------------
-    # GDELT 有 rate limiting。
-    #
-    # 如果收到 HTTP 429：
-    # 第一次等待 1 秒
-    # 第二次等待 2 秒
-    # 第三次等待 4 秒
-    #
-    # 這稱為 exponential backoff。
-    # -----------------------------------------------------
+    _respect_gdelt_rate_limit()
 
-    max_retries = 3
+    max_attempts = 2
 
-    for attempt in range(max_retries):
+    for attempt in range(max_attempts):
         try:
             response = requests.get(
                 GDELT_DOC_API,
                 params=params,
-
-                # 原本 20 秒可能讓 browser endpoint
-                # 卡非常久。
-                #
-                # 目前 integration/debug 階段
-                # 先縮短成 10 秒。
-                timeout=10,
+                timeout=25,
+                headers=GDELT_HEADERS,
             )
-
         except requests.RequestException as exc:
-            print(f"GDELT request failed: {exc}")
-            return []
-
-        # -------------------------------------------------
-        # Rate limit handling
-        # -------------------------------------------------
+            log(f"GDELT request failed: {exc}")
+            if attempt < max_attempts - 1:
+                time.sleep(10)
+                continue
+            return None
 
         if response.status_code == 429:
-            wait_seconds = 2 ** attempt
+            if attempt < max_attempts - 1:
+                log("GDELT rate limited. Retrying in 10s...")
+                time.sleep(10)
+                continue
+            log("GDELT still rate limited after retry.")
+            return None
 
-            print(
-                f"GDELT rate limited request. "
-                f"Retrying in {wait_seconds}s..."
-            )
-
-            time.sleep(wait_seconds)
-            continue
-
-        # 其他 4xx / 5xx HTTP error。
         try:
             response.raise_for_status()
-
         except requests.HTTPError as exc:
-            print(f"GDELT HTTP error: {exc}")
-            return []
+            log(f"GDELT HTTP error: {exc}")
+            return None
 
-        # -------------------------------------------------
-        # GDELT normally returns JSON because format=json.
-        #
-        # 但我們之前實際遇過 response 不是有效 JSON，
-        # 所以這裡不能直接假設 response.json() 一定成功。
-        # -------------------------------------------------
+        body = response.text.strip()
+
+        if "too short or too long" in body.lower():
+            log(
+                f"GDELT rejected query as too long "
+                f"({len(full_query)} chars): {body[:120]}"
+            )
+            return []
 
         try:
             data = response.json()
-
         except requests.exceptions.JSONDecodeError:
-            print("GDELT returned invalid JSON:")
-            print(response.text[:500])
+            log("GDELT returned invalid JSON:")
+            log(body[:500])
             return []
 
-        return data.get("articles", [])
+        articles = data.get("articles", []) if isinstance(data, dict) else []
+        if not articles:
+            log(f"GDELT returned 0 articles. body={body[:200]!r}")
+        else:
+            log(f"GDELT returned {len(articles)} raw articles")
+        return articles
 
-    # 三次都被 rate limit。
-    print("GDELT request failed after all retries.")
-    return []
+    return None
 
 
 # ---------------------------------------------------------
@@ -383,62 +370,134 @@ def fetch_gdelt_articles(query: str, max_records: int = 50):
 #
 # 流程：
 #
-# SEARCH_QUERIES
-#     ↓
-# GDELT
+# 1 次 GDELT
 #     ↓
 # trusted source filter
 #     ↓
 # URL deduplication
 #     ↓
-# category tagging
+# 本地 category tagging
 #     ↓
 # candidate article list
 # ---------------------------------------------------------
 
 def fetch_all_candidate_articles():
-    all_articles = []
+    if _candidate_cache["articles"] is None:
+        disk = _load_disk_cache()
+        if disk:
+            _candidate_cache["articles"] = disk
+            log(f"Loaded {len(disk)} articles from disk cache")
 
-    # 用 set 儲存已經看過的 URL。
-    # set 的 membership lookup 很快，
-    # 適合拿來做 deduplication。
-    seen_urls = set()
+    now = time.time()
+    cached_articles = _candidate_cache["articles"]
 
-    # 四大 category → 四次主要 GDELT request。
-    for category, query in SEARCH_QUERIES.items():
-        articles = fetch_gdelt_articles(query)
+    if (
+        cached_articles is not None
+        and now - _candidate_cache["fetched_at"] < CANDIDATE_CACHE_TTL_SECONDS
+    ):
+        log(
+            f"Returning {len(cached_articles)} cached candidate articles"
+        )
+        return cached_articles
+
+    with _fetch_lock:
+        now = time.time()
+        cached_articles = _candidate_cache["articles"]
+
+        if (
+            cached_articles is not None
+            and now - _candidate_cache["fetched_at"] < CANDIDATE_CACHE_TTL_SECONDS
+        ):
+            log(
+                f"Returning {len(cached_articles)} cached candidate articles"
+            )
+            return cached_articles
+
+        articles = fetch_gdelt_articles(GDELT_CANDIDATE_QUERY)
+
+        if articles is None:
+            previous = _previous_articles()
+            if previous:
+                log(
+                    f"GDELT failed; returning {len(previous)} previously cached articles"
+                )
+                return previous
+            log("GDELT failed and cache is empty")
+            return []
+
+        all_articles = []
+        seen_urls = set()
 
         for article in articles:
             url = article.get("url")
-            domain = article.get("domain")
+            domain = article.get("domain") or urlparse(url or "").netloc
 
-            # 沒有 URL 或 domain 的資料無法可靠處理。
             if not url or not domain:
                 continue
 
-            normalized_domain = normalize_domain(domain)
-
-            # ---------------------------------------------
-            # Trusted source Hard Filter
-            # ---------------------------------------------
-            # 不可信來源直接淘汰，
-            # 不進 event dedup / ranking / LLM。
-            # ---------------------------------------------
-
-            if normalized_domain not in TRUSTED_SOURCES:
+            if not is_trusted_source(domain):
                 continue
-
-            # ---------------------------------------------
-            # URL deduplication
-            # ---------------------------------------------
 
             if url in seen_urls:
                 continue
 
-            # 標記這則新聞是由哪一組搜尋邏輯找到。
-            article["category"] = category
+            article["category"] = classify_article(article)
+            article["domain"] = normalize_domain(domain)
 
             seen_urls.add(url)
             all_articles.append(article)
 
-    return all_articles
+        log(f"candidates raw={len(articles)} kept={len(all_articles)}")
+
+        if all_articles:
+            _candidate_cache["articles"] = all_articles
+            _candidate_cache["fetched_at"] = time.time()
+            _save_disk_cache(all_articles)
+
+        return all_articles
+
+
+def parse_gdelt_time(value: str | None) -> datetime:
+    if not value:
+        return datetime.utcnow()
+
+    try:
+        return datetime.strptime(value, "%Y%m%dT%H%M%SZ")
+    except ValueError:
+        return datetime.utcnow()
+
+
+def get_latest_signals():
+    articles = fetch_all_candidate_articles()
+
+    ranked_articles = rank_articles(articles)
+
+    top_articles = ranked_articles[:3]
+
+    signals = []
+
+    for index, article in enumerate(top_articles, start=1):
+        domain = article.get("domain") or ""
+        source_name = SOURCE_DISPLAY.get(domain, domain)
+        category = article.get("category") or "uncategorized"
+
+        signals.append(
+            {
+                "id": index,
+                "title": (article.get("title") or "").strip(),
+                "summary_points": [
+                    f"來源：{source_name}",
+                    f"主題：{category}",
+                ],
+                "category": "investment",
+                "subcategory": category,
+                "impact_path": "待後續 ranking / LLM 產生",
+                "importance_score": article.get("importance_score", 0),
+                "top_rank": index,
+                "source_name": source_name,
+                "source_url": article.get("url") or "",
+                "published_at": parse_gdelt_time(article.get("seendate")),
+            }
+        )
+
+    return signals

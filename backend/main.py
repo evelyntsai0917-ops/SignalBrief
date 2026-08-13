@@ -102,32 +102,29 @@ app.add_middleware(
 # 這個 endpoint 是 frontend 真正應該使用的 API。
 #
 # 現階段：
-#   → 使用 mock_signals
+#   → 呼叫 GDELT，回傳 trusted source 新聞
 #
-# 未來正式版：
-#   → 讀取每天早上 08:00 已經處理完成並儲存的資料
-#
-# 很重要：
-# 正式版不應該每次 user 打開網站，
-# 就重新呼叫 GDELT。
+# 之後你可以自己接：
+#   → database / AWS / LLM
 # ---------------------------------------------------------
 
 @app.get("/api/signals", response_model=SignalResponse)
 def get_signals():
+    signals = get_latest_signals()
+
     return {
-        "updated_at": "2026-08-12T08:00:00",
-        "signals": get_latest_signals(),
+        "updated_at": datetime.utcnow(),
+        "signals": signals,
     }
 
 
 # ---------------------------------------------------------
 # GDELT candidate inspection API
 # ---------------------------------------------------------
-# 1. 呼叫 GDELT
-# 2. 跑四個 SignalBrief 搜尋 category
-# 3. 只保留 trusted sources
-# 4. 移除 URL 重複文章
-# 5. 回傳尚未做 event dedup / ranking 的候選新聞
+# 1. 打 1 次 GDELT
+# 2. 只保留 trusted sources
+# 3. 本地標 category
+# 4. 回傳尚未做 event dedup / ranking 的候選新聞
 # ---------------------------------------------------------
 
 @app.get("/api/news/candidates")
