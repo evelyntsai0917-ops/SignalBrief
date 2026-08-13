@@ -26,8 +26,12 @@ onMounted(async () => {
 <template>
   <h1>SignalBrief</h1>
   <p>Last updated: {{ formattedUpdatedAt() }}</p>
-  <<div v-for="signal in signals" :key="signal.id">
+  <div v-for="signal in signals" :key="signal.id">
     <h2>{{ signal.title }}</h2>
-    <p>{{ signal.summary }}</p>
+     <ul>
+      <li v-for="point in signal.summary_points" :key="point">
+        {{ point }}
+      </li>
+    </ul>
   </div>
 </template>
