@@ -14,7 +14,7 @@
 # candidate articles
 # ---------------------------------------------------------
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 import json
@@ -22,6 +22,8 @@ import threading
 import time
 import requests
 from services.ranking_service import rank_articles
+from services.llm_service import analyze_articles
+from services.dedup_service import deduplicate_events
 
 
 def log(message: str):
@@ -406,7 +408,8 @@ def fetch_all_candidate_articles():
 
         if (
             cached_articles is not None
-            and now - _candidate_cache["fetched_at"] < CANDIDATE_CACHE_TTL_SECONDS
+            and now - _candidate_cache["fetched_at"]
+            < CANDIDATE_CACHE_TTL_SECONDS
         ):
             log(
                 f"Returning {len(cached_articles)} cached candidate articles"
@@ -417,29 +420,77 @@ def fetch_all_candidate_articles():
 
         if articles is None:
             previous = _previous_articles()
+
             if previous:
                 log(
-                    f"GDELT failed; returning {len(previous)} previously cached articles"
+                    f"GDELT failed; returning "
+                    f"{len(previous)} previously cached articles"
                 )
                 return previous
+
             log("GDELT failed and cache is empty")
             return []
+
+        # -------------------------------------------------
+        # Only keep articles from the latest 24 hours
+        # -------------------------------------------------
+
+        cutoff_time = (
+            datetime.now(timezone.utc)
+            - timedelta(hours=24)
+        )
 
         all_articles = []
         seen_urls = set()
 
         for article in articles:
             url = article.get("url")
-            domain = article.get("domain") or urlparse(url or "").netloc
+            domain = (
+                article.get("domain")
+                or urlparse(url or "").netloc
+            )
 
             if not url or not domain:
                 continue
 
+            # ---------------------------------------------
+            # 24-hour publication time filter
+            # ---------------------------------------------
+
+            seendate = article.get("seendate")
+
+            if not seendate:
+                continue
+
+            try:
+                published_time = datetime.strptime(
+                    seendate,
+                    "%Y%m%dT%H%M%SZ",
+                ).replace(tzinfo=timezone.utc)
+
+            except ValueError:
+                continue
+
+            if published_time < cutoff_time:
+                continue
+
+            # ---------------------------------------------
+            # Trusted source hard filter
+            # ---------------------------------------------
+
             if not is_trusted_source(domain):
                 continue
 
+            # ---------------------------------------------
+            # URL deduplication
+            # ---------------------------------------------
+
             if url in seen_urls:
                 continue
+
+            # ---------------------------------------------
+            # Local category tagging
+            # ---------------------------------------------
 
             article["category"] = classify_article(article)
             article["domain"] = normalize_domain(domain)
@@ -447,15 +498,18 @@ def fetch_all_candidate_articles():
             seen_urls.add(url)
             all_articles.append(article)
 
-        log(f"candidates raw={len(articles)} kept={len(all_articles)}")
+        log(
+            f"candidates raw={len(articles)} "
+            f"kept_24h={len(all_articles)}"
+        )
 
         if all_articles:
             _candidate_cache["articles"] = all_articles
             _candidate_cache["fetched_at"] = time.time()
+
             _save_disk_cache(all_articles)
 
         return all_articles
-
 
 def parse_gdelt_time(value: str | None) -> datetime:
     if not value:
@@ -468,35 +522,114 @@ def parse_gdelt_time(value: str | None) -> datetime:
 
 
 def get_latest_signals():
+    # -----------------------------------------------------
+    # 1. 取得最近 24 小時的 candidate articles
+    # -----------------------------------------------------
     articles = fetch_all_candidate_articles()
 
+    # -----------------------------------------------------
+    # 2. 用規則 ranking 做第一層粗篩
+    #    避免所有文章都直接送給 LLM
+    # -----------------------------------------------------
     ranked_articles = rank_articles(articles)
 
-    top_articles = ranked_articles[:3]
+    # 目前只取前 10 篇交給 Groq 分析
+    llm_candidates = ranked_articles[:10]
+
+    # -----------------------------------------------------
+    # 3. Groq AI 分析
+    #
+    # AI 會判斷：
+    # - 是否為真正事件
+    # - article type
+    # - investment relevance
+    # - importance score
+    # - subcategory
+    # - 中文事件摘要
+    # - impact path
+    #
+    # analyze_articles() 也會把非事件型文章淘汰
+    # -----------------------------------------------------
+    analyzed_articles = analyze_articles(llm_candidates)
+
+    # -----------------------------------------------------
+    # 4. Event deduplication
+    #
+    # 如果多篇文章其實屬於同一個事件，
+    # 只保留 importance_score 最高的一篇
+    # -----------------------------------------------------
+    deduplicated_articles = deduplicate_events(
+        analyzed_articles
+    )
+
+    # -----------------------------------------------------
+    # 5. 最終 Top 3
+    # -----------------------------------------------------
+    top_articles = deduplicated_articles[:3]
 
     signals = []
 
+    # -----------------------------------------------------
+    # 6. 整理成 frontend / API 要的 Signal 格式
+    # -----------------------------------------------------
     for index, article in enumerate(top_articles, start=1):
         domain = article.get("domain") or ""
-        source_name = SOURCE_DISPLAY.get(domain, domain)
-        category = article.get("category") or "uncategorized"
+
+        source_name = SOURCE_DISPLAY.get(
+            domain,
+            domain,
+        )
+
+        # 優先使用 AI 判斷的 subcategory。
+        # 如果 AI 沒有回傳，才退回原本 keyword 分類。
+        category = (
+            article.get("subcategory")
+            or article.get("category")
+            or "other"
+        )
 
         signals.append(
             {
                 "id": index,
-                "title": (article.get("title") or "").strip(),
+
+                "title": (
+                    article.get("title")
+                    or ""
+                ).strip(),
+
                 "summary_points": [
-                    f"來源：{source_name}",
-                    f"主題：{category}",
+                    article.get(
+                        "event_summary",
+                        "",
+                    )
                 ],
+
                 "category": "investment",
+
                 "subcategory": category,
-                "impact_path": "待後續 ranking / LLM 產生",
-                "importance_score": article.get("importance_score", 0),
+
+                "impact_path": article.get(
+                    "impact_path",
+                    "",
+                ),
+
+                "importance_score": article.get(
+                    "importance_score",
+                    0,
+                ),
+
                 "top_rank": index,
+
                 "source_name": source_name,
-                "source_url": article.get("url") or "",
-                "published_at": parse_gdelt_time(article.get("seendate")),
+
+                "source_url": (
+                    article.get("url")
+                    or ""
+                ),
+
+                "published_at": parse_gdelt_time(
+                    article.get("seendate")
+                ),
             }
         )
 
