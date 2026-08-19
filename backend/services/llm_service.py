@@ -1,6 +1,11 @@
 import json
 from groq import Groq
+import os
 
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL",
+    "openai/gpt-oss-120b",
+)
 
 client = Groq()
 
@@ -86,7 +91,7 @@ Important:
 """
 
     completion = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
+        model= GROQ_MODEL,
         messages=[
             {
                 "role": "system",

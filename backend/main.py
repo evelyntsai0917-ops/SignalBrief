@@ -16,7 +16,7 @@ from datetime import datetime
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
+import os
 from database import Base, engine, SessionLocal
 import models
 
@@ -116,17 +116,18 @@ app = FastAPI()
 # 還會加入正式 frontend domain。
 # ---------------------------------------------------------
 
+FRONTEND_ORIGIN = os.getenv(
+    "FRONTEND_ORIGIN",
+    "http://localhost:5173",
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-    ],
+    allow_origins=[FRONTEND_ORIGIN],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
 # ---------------------------------------------------------
 # GET /api/signals
 # ---------------------------------------------------------
