@@ -20,7 +20,9 @@ from services.news_service import (
     get_latest_signals,
     fetch_all_candidate_articles,
 )
-
+from database import Base, engine, SessionLocal
+import models
+from services.signal_service import save_signals
 
 # ---------------------------------------------------------
 # Pydantic response model
@@ -80,6 +82,7 @@ class SignalResponse(BaseModel):
 # 建立 FastAPI application
 # ---------------------------------------------------------
 
+Base.metadata.create_all(bind=engine)
 app = FastAPI()
 
 
@@ -112,11 +115,17 @@ app.add_middleware(
 def get_signals():
     signals = get_latest_signals()
 
+    db = SessionLocal()
+
+    try:
+        save_signals(db, signals)
+    finally:
+        db.close()
+
     return {
         "updated_at": datetime.utcnow(),
         "signals": signals,
     }
-
 
 # ---------------------------------------------------------
 # GDELT candidate inspection API

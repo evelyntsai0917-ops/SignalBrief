@@ -19,3 +19,5 @@ watchfiles==1.2.0
 websockets==17.0.1
 requests
 groq
+sqlalchemy
+psycopg2-binary
