@@ -104,6 +104,16 @@ app = FastAPI()
 
 
 # ---------------------------------------------------------
+# Health Check
+# 提供給 AWS ALB / Target Group 檢查 backend 是否正常運作
+# 成功時回傳 HTTP 200，表示 FastAPI application 可以正常回應
+# ---------------------------------------------------------
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+    
+# ---------------------------------------------------------
 # CORS configuration
 # ---------------------------------------------------------
 # 允許目前 local Vue frontend：
