@@ -5,3 +5,4 @@ __pycache__/
 backend/data/*.db
 backend/data/candidates_cache.json
 backend/data/
+frontend/dist/
