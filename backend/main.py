@@ -29,8 +29,7 @@ from services.signal_service import (
     save_signals,
     get_saved_signals,
 )
-
-
+from services.refresh_service import run_signal_refresh
 # ---------------------------------------------------------
 # Pydantic response model
 # ---------------------------------------------------------
@@ -282,27 +281,9 @@ def get_candidate_articles():
     response_model=SignalResponse,
 )
 def refresh_signals():
-    # 執行完整新聞 pipeline，
-    # 取得新的 Top 3。
-    signals = get_latest_signals()
+    signals = run_signal_refresh()
 
-    # 建立 database session
-    db = SessionLocal()
-
-    try:
-        # 把新的 Top 3 寫進 PostgreSQL
-        save_signals(
-            db,
-            signals,
-        )
-
-        # 同時把這次產生的 Top 3 回傳，
-        # 方便 Swagger / Postman 測試。
-        return {
-            "updated_at": datetime.utcnow(),
-            "signals": signals,
-        }
-
-    finally:
-        # 不管成功或失敗都關閉 DB session
-        db.close()
+    return {
+        "updated_at": datetime.utcnow(),
+        "signals": signals,
+    }
